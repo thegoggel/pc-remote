@@ -1,4 +1,4 @@
-# Listens on the PC's LAN address and starts steam.exe. Nothing else.
+# Listens on the PC's LAN address. Starts steam.exe, or shuts Windows down. Nothing else.
 # Run at logon in the desktop session. See the README.
 
 $ErrorActionPreference = "Stop"
@@ -73,6 +73,24 @@ function Start-SteamClient([string]$Path) {
     Start-Process -FilePath $Path -WorkingDirectory $folder | Out-Null
 }
 
+function Start-WindowsShutdown {
+    # Fixed program and arguments. A normal local shutdown, not a shell, and not a command from the request.
+    $shutdown = Join-Path $env:SystemRoot "System32\shutdown.exe"
+    if (-not (Test-Path -LiteralPath $shutdown)) {
+        throw "Windows shutdown was not found."
+    }
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo.FileName = $shutdown
+    $proc.StartInfo.Arguments = "/s /t 0"
+    $proc.StartInfo.UseShellExecute = $false
+    $proc.StartInfo.CreateNoWindow = $true
+    [void]$proc.Start()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "Windows did not shut down."
+    }
+}
+
 function Handle-Request($Context, [string]$Secret, [string]$SteamPath) {
     $request = $Context.Request
     $response = $Context.Response
@@ -82,7 +100,7 @@ function Handle-Request($Context, [string]$Secret, [string]$SteamPath) {
             return
         }
         $path = $request.Url.AbsolutePath
-        if ($request.HttpMethod -ne "POST" -or $path -ne "/start") {
+        if ($request.HttpMethod -ne "POST" -or (($path -ne "/start") -and ($path -ne "/shutdown"))) {
             Write-Json $response 404 '{"ok":false}'
             return
         }
@@ -95,10 +113,15 @@ function Handle-Request($Context, [string]$Secret, [string]$SteamPath) {
             Write-Json $response 401 '{"ok":false}'
             return
         }
+        if ($path -eq "/shutdown") {
+            Start-WindowsShutdown
+            Write-Json $response 200 '{"ok":true}'
+            return
+        }
         Start-SteamClient $SteamPath
         Write-Json $response 200 '{"ok":true}'
     } catch {
-        Write-Output "Steam did not start."
+        Write-Output "The request did not finish."
         try { Write-Json $response 500 '{"ok":false}' } catch { }
     }
 }
@@ -106,7 +129,7 @@ function Handle-Request($Context, [string]$Secret, [string]$SteamPath) {
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add($ListenPrefix)
 $listener.Start()
-Write-Output "Steam listener is waiting."
+Write-Output "Listener is waiting."
 try {
     while ($listener.IsListening) {
         $context = $null
