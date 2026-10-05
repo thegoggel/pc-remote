@@ -1,0 +1,6 @@
+# Copy this file to config.ps1 next to steam-listener.ps1.
+# config.ps1 stays on the PC. Do not commit it.
+
+$ListenerSecret = "replace-with-a-long-random-secret"
+$ListenPrefix = "http://192.168.88.50:8765/"
+$SteamExe = "C:\Program Files (x86)\Steam\steam.exe"
