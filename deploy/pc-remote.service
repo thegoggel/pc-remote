@@ -1,5 +1,5 @@
 [Unit]
-Description=PC Remote wake and Steam
+Description=PC Remote wake, Steam, and shutdown
 After=network-online.target
 Wants=network-online.target
 

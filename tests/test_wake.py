@@ -2,7 +2,15 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from app.wake import NotReady, WakeError, WakeService, http_answers, request_steam_start
+from app.wake import (
+    NotReady,
+    WakeError,
+    WakeService,
+    http_answers,
+    request_shutdown,
+    request_steam_start,
+    shutdown_url,
+)
 
 SECRET = "listener-secret-value"
 
@@ -245,6 +253,51 @@ class SteamRequestTests(unittest.TestCase):
         sock.close()
         with self.assertRaises(NotReady):
             request_steam_start(f"http://127.0.0.1:{port}/start", SECRET, timeout=0.5)
+
+
+class ShutdownRequestTests(unittest.TestCase):
+    def test_url_stays_on_the_listener(self):
+        self.assertEqual(
+            shutdown_url("http://192.168.88.50:8765/start"),
+            "http://192.168.88.50:8765/shutdown",
+        )
+        self.assertEqual(
+            shutdown_url("http://user:secret@192.168.88.50:8765/start?next=/run"),
+            "http://192.168.88.50:8765/shutdown",
+        )
+        self.assertNotIn("secret", shutdown_url("http://user:secret@192.168.88.50:8765/start"))
+
+    def test_one_authenticated_post(self):
+        listener = ListenerDouble()
+        self.addCleanup(listener.close)
+        request_shutdown(f"http://127.0.0.1:{listener.port}/shutdown", SECRET, timeout=2)
+        self.assertEqual(listener.requests, [("POST", "/shutdown", f"Bearer {SECRET}")])
+
+    def test_unauthorized(self):
+        listener = ListenerDouble(status=401)
+        self.addCleanup(listener.close)
+        with self.assertRaises(WakeError) as caught:
+            request_shutdown(f"http://127.0.0.1:{listener.port}/shutdown", SECRET, timeout=2)
+        self.assertIn("rejected", str(caught.exception))
+        self.assertNotIn(SECRET, str(caught.exception))
+
+    def test_redirect_is_not_followed(self):
+        listener = ListenerDouble(redirect="http://127.0.0.1:1/stolen")
+        self.addCleanup(listener.close)
+        with self.assertRaises(WakeError) as caught:
+            request_shutdown(f"http://127.0.0.1:{listener.port}/shutdown", SECRET, timeout=1)
+        self.assertIn("did not turn off", str(caught.exception))
+        self.assertEqual(len(listener.requests), 1)
+
+    def test_closed_port_is_a_single_failure(self):
+        sock = __import__("socket").socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        with self.assertRaises(WakeError) as caught:
+            request_shutdown(f"http://127.0.0.1:{port}/shutdown", SECRET, timeout=0.5)
+        self.assertEqual(str(caught.exception), "The PC did not answer.")
+        self.assertNotIn(SECRET, str(caught.exception))
 
 
 if __name__ == "__main__":

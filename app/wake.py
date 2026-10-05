@@ -1,4 +1,7 @@
-"""Send Wake-on-LAN, wait until the PC answers, then ask it to start Steam."""
+"""Send Wake-on-LAN, wait until the PC answers, then ask it to start Steam.
+
+Shutdown is a separate request to the same LAN listener. It does not send a magic packet.
+"""
 
 from __future__ import annotations
 
@@ -157,6 +160,39 @@ def request_steam_start(url: str, secret: str, timeout: float = 10, opener=None)
         raise WakeError("The PC answered, but Steam did not start.") from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise NotReady() from None
+
+
+def shutdown_url(listener_url: str) -> str:
+    """Same listener host and port, path /shutdown. Drops userinfo, query, and fragment."""
+    parts = urllib.parse.urlsplit(listener_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise WakeError("The PC did not turn off.")
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urllib.parse.urlunsplit((parts.scheme, netloc, "/shutdown", "", ""))
+
+
+def request_shutdown(url: str, secret: str, timeout: float = 10, opener=None) -> None:
+    """Ask the LAN listener to shut Windows down. One normal shutdown, nothing else."""
+    request = urllib.request.Request(url, data=b"", method="POST")
+    request.add_header("Authorization", f"Bearer {secret}")
+    request.add_header("Connection", "close")
+    open_url = opener or _opener().open
+    try:
+        with open_url(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise WakeError("The PC did not turn off.")
+            response.read(128)
+    except WakeError:
+        raise
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise WakeError("The PC rejected the shutdown request.") from None
+        raise WakeError("The PC did not turn off.") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise WakeError("The PC did not answer.") from None
 
 
 def build_wake_service(config) -> WakeService:

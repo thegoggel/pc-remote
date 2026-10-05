@@ -1,16 +1,17 @@
-"""HTTP app: Google sign-in, then one button that wakes the PC and starts Steam."""
+"""HTTP app: Google sign-in, then wake the PC or turn it off."""
 
 from __future__ import annotations
 
 import hmac
 import logging
 import secrets
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from app.config import Config, load_config
 from app.oauth import authorization_url, fetch_email
-from app.pages import app_page, login_page
+from app.pages import app_page, confirm_off_page, login_page
 from app.session import (
     SESSION_TTL_SECONDS,
     STATE_TTL_SECONDS,
@@ -19,16 +20,34 @@ from app.session import (
     read_session,
     read_state,
 )
-from app.wake import build_wake_service
+from app.wake import WakeError, build_wake_service, request_shutdown, shutdown_url
 
 log = logging.getLogger(__name__)
 
+_SAFE_SHUTDOWN = {
+    "The PC did not answer.",
+    "The PC rejected the shutdown request.",
+    "The PC did not turn off.",
+}
+
 
 class App:
-    def __init__(self, config: Config, wake, fetch=None):
+    def __init__(self, config: Config, wake, fetch=None, shutdown=None):
         self.config = config
         self.wake = wake
         self.fetch_email = fetch_email if fetch is None else fetch
+        self.shutdown = shutdown
+        self._note_lock = threading.Lock()
+        self._shutdown_note = ""
+        self.shutdown_lock = threading.Lock()
+
+    def shutdown_note(self) -> str:
+        with self._note_lock:
+            return self._shutdown_note
+
+    def set_shutdown_note(self, note: str) -> None:
+        with self._note_lock:
+            self._shutdown_note = note
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -39,6 +58,8 @@ class Handler(BaseHTTPRequestHandler):
         path, query = _split(self.path)
         if path == "/":
             self._home(query)
+        elif path == "/turn-off":
+            self._confirm_off()
         elif path == "/auth/google":
             self._start_google()
         elif path == "/auth/callback":
@@ -48,11 +69,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path, _query = _split(self.path)
-        if not self._discard_body():
+        form = self._read_form()
+        if form is None:
             self._plain(413, "Request too large")
             return
         if path == "/wake":
             self._wake()
+        elif path == "/shutdown":
+            self._shutdown(form)
         elif path == "/logout":
             self._logout()
         else:
@@ -71,7 +95,17 @@ class Handler(BaseHTTPRequestHandler):
             self._html(200, login_page(error))
             return
         snap = self.server.app.wake.snapshot()
-        self._html(200, app_page(email, snap["phase"], snap["detail"]))
+        self._html(
+            200,
+            app_page(email, snap["phase"], snap["detail"], self.server.app.shutdown_note()),
+        )
+
+    def _confirm_off(self) -> None:
+        email = self._email()
+        if not email:
+            self._redirect("/")
+            return
+        self._html(200, confirm_off_page(email))
 
     def _start_google(self) -> None:
         state = secrets.token_urlsafe(32)
@@ -144,8 +178,49 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._redirect("/", status=303)
             return
+        self.server.app.set_shutdown_note("")
         self.server.app.wake.start()
         log.info("wake started")
+        self._redirect("/", status=303)
+
+    def _shutdown(self, form: dict[str, list[str]]) -> None:
+        origin_ok = self._same_origin()
+        signed_in = self._email() is not None
+        if not origin_ok or not signed_in:
+            log.info(
+                "shutdown refused origin_ok=%s signed_in=%s origin=%s",
+                origin_ok,
+                signed_in,
+                self.headers.get("Origin"),
+            )
+            self._redirect("/", status=303)
+            return
+        if form.get("confirm") != ["yes"]:
+            self._redirect("/turn-off", status=303)
+            return
+        if not self.server.app.shutdown_lock.acquire(blocking=False):
+            self._redirect("/", status=303)
+            return
+        note = "The PC did not turn off."
+        try:
+            action = self.server.app.shutdown
+            if action is None:
+                log.info("shutdown failed")
+            else:
+                try:
+                    action()
+                except WakeError as exc:
+                    message = str(exc)
+                    note = message if message in _SAFE_SHUTDOWN else "The PC did not turn off."
+                    log.info("shutdown failed")
+                except Exception:
+                    log.exception("shutdown failed")
+                else:
+                    note = "The PC is turning off."
+                    log.info("shutdown accepted")
+        finally:
+            self.server.app.set_shutdown_note(note)
+            self.server.app.shutdown_lock.release()
         self._redirect("/", status=303)
 
     def _logout(self) -> None:
@@ -184,17 +259,22 @@ class Handler(BaseHTTPRequestHandler):
             found[name.strip()] = value.strip()
         return found
 
-    def _discard_body(self) -> bool:
+    def _read_form(self) -> dict[str, list[str]] | None:
         raw = self.headers.get("Content-Length", "0") or "0"
         try:
             length = int(raw)
         except ValueError:
-            return False
+            return None
         if length < 0 or length > 4096:
-            return False
-        if length:
-            self.rfile.read(length)
-        return True
+            return None
+        data = self.rfile.read(length) if length else b""
+        if len(data) != length:
+            return None
+        text = data.decode("utf-8", "replace")
+        try:
+            return urllib.parse.parse_qs(text, max_num_fields=8)
+        except ValueError:
+            return None
 
     def _html(self, status: int, body: str, cookies: list[str] | None = None) -> None:
         self._send(status, body.encode(), "text/html; charset=utf-8", cookies)
@@ -254,16 +334,20 @@ def _cookie(name: str, value: str, max_age: int, secure: bool, clear: bool = Fal
     return "; ".join(pieces)
 
 
-def make_server(config: Config, wake, fetch=None) -> ThreadingHTTPServer:
+def make_server(config: Config, wake, fetch=None, shutdown=None) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((config.bind_host, config.bind_port), Handler)
-    httpd.app = App(config, wake, fetch)
+    httpd.app = App(config, wake, fetch, shutdown)
     return httpd
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
-    httpd = make_server(config, build_wake_service(config))
+
+    def turn_off() -> None:
+        request_shutdown(shutdown_url(config.listener_url), config.listener_secret)
+
+    httpd = make_server(config, build_wake_service(config), shutdown=turn_off)
     host, port = httpd.server_address[:2]
     log.info("listening on %s:%s", host, port)
     try:

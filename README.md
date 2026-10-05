@@ -1,10 +1,12 @@
 # PC Remote
 
-A small web page for a phone or tablet. It wakes Nils's Windows gaming PC and starts the Steam client.
+A small web page for a phone or tablet. It wakes Nils's Windows gaming PC, starts the Steam client, and can turn the PC off.
 
-The page runs on a Proxmox LXC on the home LAN. He opens it at a hostname on his own domain, at home or away. Cloudflare Tunnel carries only that page. The app asks him to sign in with Google and keeps a session cookie. Only the Google account in `ALLOWED_EMAIL` can use the button.
+The page runs on a Proxmox LXC on the home LAN. He opens it at a hostname on his own domain, at home or away. Cloudflare Tunnel carries only that page. The app asks him to sign in with Google and keeps a session cookie. Only the Google account in `ALLOWED_EMAIL` can use the page.
 
 Wake calls the MikroTik RouterOS API. The router sends a Wake-on-LAN packet to one MAC address. The page waits until the PC answers on the LAN, then sends one authenticated request to a tiny listener that starts `steam.exe` and does nothing else.
+
+Turn off asks for confirmation, then sends one authenticated request to that same listener. The listener shuts Windows down and does nothing else. That is a normal shutdown, not a remote shell.
 
 The RouterOS API and the PC listener stay on the LAN. Do not put them on the tunnel, and do not forward them to an open port.
 
@@ -25,7 +27,7 @@ Create `/etc/pc-remote.env` on the LXC. Start from `.env.example`. Mode `600`, o
 | `MIKROTIK_INTERFACE` | Interface for `/tool wol`, often `bridge` |
 | `PC_MAC` | Gaming PC MAC, `AA:BB:CC:DD:EE:FF` |
 | `PC_ADDRESS` | Gaming PC LAN IPv4 address |
-| `LISTENER_URL` | `http://<PC_ADDRESS>:8765/start` |
+| `LISTENER_URL` | `http://<PC_ADDRESS>:8765/start`. Turn off uses this same host and port at `/shutdown`. |
 | `LISTENER_SECRET` | Shared with the Windows listener, 16 characters or more |
 
 Optional: `MIKROTIK_PORT` (default `8728`), `BIND_HOST` (default `127.0.0.1`), `BIND_PORT` (default `8080`), `WAKE_TIMEOUT_SECONDS` (default `180`).
@@ -76,7 +78,12 @@ Do not enable the API on the WAN. Do not add a dst-nat rule for port 8728.
 
 ## Windows listener
 
-The listener is `windows/steam-listener.ps1`. It accepts `POST /start` with `Authorization: Bearer <secret>`, starts `steam.exe` if it is not already running, and rejects every other request.
+The listener is `windows/steam-listener.ps1`. It accepts two requests, both with `Authorization: Bearer <secret>`:
+
+- `POST /start` starts `steam.exe` if it is not already running.
+- `POST /shutdown` runs `shutdown.exe /s /t 0` and nothing else. The arguments are fixed. The request body is not a command. This is a normal Windows shutdown, not a restart and not a remote shell.
+
+Every other request is rejected. Shutdown uses the same port as start. Do not open a second port.
 
 It has to run in his desktop session, because Steam is a GUI program. If the PC was shut down, Windows needs to reach the desktop on its own (auto-login is the straightforward way). The page stays on **Waiting for Windows** until that listener accepts a connection.
 
@@ -146,7 +153,9 @@ Restart cloudflared after editing the ingress. From the phone, on Wi-Fi or on ce
 
 Signed out, the page is only **Sign in with Google**.
 
-After sign-in, **Wake** runs the sequence. The heading is one of:
+After sign-in, **Wake** runs the sequence. **Turn off** opens a confirmation page. Nothing is sent until he confirms there. Cancel returns without shutting the PC down.
+
+The heading is one of:
 
 - **Waking** — the LXC is asking the router to send the magic packet
 - **Waiting for Windows** — the packet was sent, and the page is waiting for the PC to answer
@@ -154,6 +163,8 @@ After sign-in, **Wake** runs the sequence. The heading is one of:
 - **Failed** — the reason is under the heading
 
 While it is waking or waiting, the page refreshes on its own. The magic packet is sent again every 30 seconds until the PC answers or about three minutes pass.
+
+After a confirmed turn-off, the page says **The PC is turning off**, or the reason it did not. Wake does not run as part of turn-off. If the PC is already off, the listener does not answer, and the page says so.
 
 ## Tests
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from app.config import Config
 from app.server import make_server
 from app.session import issue_session
-from app.wake import WakeService
+from app.wake import WakeError, WakeService
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = "s" * 32
@@ -57,6 +57,17 @@ class FakeWake:
         return
 
 
+class FakeShutdown:
+    def __init__(self):
+        self.calls = 0
+        self.error = None
+
+    def __call__(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+
+
 def _headers(response):
     found = {}
     for key, value in response.getheaders():
@@ -64,7 +75,7 @@ def _headers(response):
     return found
 
 
-def _request(port, method, path, cookies="", origin=None, retries=20):
+def _request(port, method, path, cookies="", origin=None, retries=20, body=None):
     import http.client
 
     last = None
@@ -76,10 +87,17 @@ def _request(port, method, path, cookies="", origin=None, retries=20):
                 headers["Cookie"] = cookies
             if origin is not None:
                 headers["Origin"] = origin
-            body = b"" if method == "POST" else None
+            payload = None
             if method == "POST":
-                headers["Content-Length"] = "0"
-            conn.request(method, path, body=body, headers=headers)
+                if body is None:
+                    payload = b""
+                elif isinstance(body, str):
+                    payload = body.encode()
+                else:
+                    payload = body
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                headers["Content-Length"] = str(len(payload))
+            conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
             payload = response.read()
             headers = _headers(response)
@@ -99,7 +117,8 @@ def _cookie_pairs(headers):
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.wake = FakeWake()
-        self.httpd = make_server(test_config(), self.wake)
+        self.shutdown = FakeShutdown()
+        self.httpd = make_server(test_config(), self.wake, shutdown=self.shutdown)
         self.httpd.daemon_threads = True
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -116,6 +135,9 @@ class ServerTests(unittest.TestCase):
         text = body.decode()
         self.assertIn("Sign in with Google", text)
         self.assertNotIn("/wake", text)
+        self.assertNotIn("/shutdown", text)
+        self.assertNotIn("/turn-off", text)
+        self.assertNotIn("Turn off", text)
         self.assertNotIn("Steam", text)
         self.assertNotIn("Waiting for Windows", text)
         self.assertNotIn("router-secret", text)
@@ -166,6 +188,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Sign in with Google", body)
         self.assertNotIn(b'action="/wake"', body)
+        self.assertNotIn(b"Turn off", body)
+        self.assertNotIn(b'action="/shutdown"', body)
 
     def test_tampered_cookie_sees_only_the_login(self):
         token = issue_session("nils@gmail.com", SECRET)
@@ -229,6 +253,7 @@ class ServerTests(unittest.TestCase):
         _status, _headers, body = _request(self.port, "GET", "/?error=denied")
         self.assertIn(b"This Google account cannot use this page.", body)
         self.assertNotIn(b'action="/wake"', body)
+        self.assertNotIn(b'action="/shutdown"', body)
         self.assertNotIn(b"other@gmail.com", body)
 
     def test_callback_state_mismatch(self):
@@ -270,6 +295,117 @@ class ServerTests(unittest.TestCase):
                 self.assertNotIn(b'http-equiv="refresh"', body)
             if phase == "waiting":
                 self.assertIn(b'http-equiv="refresh"', body)
+                self.assertIn(b'href="/turn-off"', body)
+                self.assertNotIn(b'action="/shutdown"', body)
+
+    def test_turn_off_asks_before_it_sends_shutdown(self):
+        cookie = f"pc_session={issue_session('nils@gmail.com', SECRET)}"
+        status, _headers, body = _request(self.port, "GET", "/", cookies=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b'href="/turn-off"', body)
+        self.assertNotIn(b'action="/shutdown"', body)
+        self.assertNotIn(b"listener-secret-value", body)
+
+        status, headers, _body = _request(self.port, "GET", "/turn-off")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers["location"], ["/"])
+        self.assertEqual(self.shutdown.calls, 0)
+
+        status, _headers, body = _request(self.port, "GET", "/turn-off", cookies=cookie)
+        self.assertEqual(status, 200)
+        text = body.decode()
+        self.assertIn("Turn off the PC?", text)
+        self.assertIn('action="/shutdown"', text)
+        self.assertIn('name="confirm" value="yes"', text)
+        self.assertIn('href="/"', text)
+        self.assertNotIn("listener-secret-value", text)
+        self.assertNotIn('http-equiv="refresh"', text)
+
+        status, headers, _body = _request(
+            self.port, "POST", "/shutdown", cookies=cookie, origin=ORIGIN
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["location"], ["/turn-off"])
+        self.assertEqual(self.shutdown.calls, 0)
+        self.assertEqual(self.wake.started, 0)
+
+        status, headers, _body = _request(
+            self.port,
+            "POST",
+            "/shutdown",
+            cookies=cookie,
+            origin=ORIGIN,
+            body="confirm=yes",
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["location"], ["/"])
+        self.assertEqual(self.shutdown.calls, 1)
+        self.assertEqual(self.wake.started, 0)
+        _status, _headers, body = _request(self.port, "GET", "/", cookies=cookie)
+        self.assertIn(b"The PC is turning off.", body)
+        self.assertNotIn(b"listener-secret-value", body)
+
+        _request(self.port, "POST", "/wake", cookies=cookie, origin=ORIGIN)
+        self.assertEqual(self.wake.started, 1)
+        self.assertEqual(self.shutdown.calls, 1)
+        _status, _headers, body = _request(self.port, "GET", "/", cookies=cookie)
+        self.assertNotIn(b"The PC is turning off.", body)
+        self.assertIn(b"Waking", body)
+
+    def test_shutdown_requires_a_session_and_the_right_origin(self):
+        cookie = f"pc_session={issue_session('nils@gmail.com', SECRET)}"
+        status, _headers, _body = _request(
+            self.port, "POST", "/shutdown", origin=ORIGIN, body="confirm=yes"
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.shutdown.calls, 0)
+
+        status, _headers, _body = _request(
+            self.port,
+            "POST",
+            "/shutdown",
+            cookies=cookie,
+            origin="https://evil.example",
+            body="confirm=yes",
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.shutdown.calls, 0)
+
+        status, _headers, _body = _request(
+            self.port, "POST", "/shutdown", cookies=cookie, origin="null", body="confirm=yes"
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.shutdown.calls, 0)
+
+    def test_shutdown_failure_hides_unexpected_details(self):
+        cookie = f"pc_session={issue_session('nils@gmail.com', SECRET)}"
+        self.shutdown.error = RuntimeError("super-secret-value")
+        status, _headers, _body = _request(
+            self.port,
+            "POST",
+            "/shutdown",
+            cookies=cookie,
+            origin=ORIGIN,
+            body="confirm=yes",
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.shutdown.calls, 1)
+        _status, _headers, body = _request(self.port, "GET", "/", cookies=cookie)
+        self.assertIn(b"The PC did not turn off.", body)
+        self.assertNotIn(b"super-secret-value", body)
+
+        self.shutdown.error = WakeError("The PC did not answer.")
+        _request(
+            self.port,
+            "POST",
+            "/shutdown",
+            cookies=cookie,
+            origin=ORIGIN,
+            body="confirm=yes",
+        )
+        _status, _headers, body = _request(self.port, "GET", "/", cookies=cookie)
+        self.assertIn(b"The PC did not answer.", body)
+        self.assertNotIn(b"super-secret-value", body)
 
 
 class WakeThroughServerTests(unittest.TestCase):

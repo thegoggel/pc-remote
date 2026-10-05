@@ -31,7 +31,7 @@ main { width: min(100%, 26rem); }
 h1 { font-size: 2rem; line-height: 1.15; margin: 0 0 12px; }
 .who, .detail, .note { color: var(--muted); margin: 0 0 20px; }
 .who { font-size: 0.95rem; }
-a.button, button.primary {
+a.button, button.primary, button.danger {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -45,9 +45,25 @@ a.button, button.primary {
   text-decoration: none;
 }
 button.primary:disabled { opacity: 0.5; }
-a.button:focus-visible, button:focus-visible {
+a.button.secondary {
+  margin-top: 12px;
+  min-height: 3.25rem;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid #5c6770;
+  font-size: 1.05rem;
+}
+button.danger { background: var(--bad); color: #1a080a; }
+a.button:focus-visible, button:focus-visible, a.cancel:focus-visible {
   outline: 3px solid var(--text);
   outline-offset: 3px;
+}
+a.cancel {
+  display: block;
+  margin-top: 22px;
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
 }
 form.out { margin: 22px 0 0; }
 button.link {
@@ -97,7 +113,7 @@ def login_page(error: str) -> str:
     return _document("Sign in", body, refresh=False)
 
 
-def app_page(email: str, phase: str, detail: str) -> str:
+def app_page(email: str, phase: str, detail: str, shutdown_note: str = "") -> str:
     if phase not in _HEADINGS:
         phase = "failed"
     heading = _HEADINGS[phase]
@@ -110,20 +126,40 @@ def app_page(email: str, phase: str, detail: str) -> str:
     busy = phase in ("waking", "waiting")
     disabled = " disabled" if busy else ""
     label = _BUTTONS.get(phase, "Wake")
+    note = ""
+    if shutdown_note:
+        note = f'\n  <p class="note">{html.escape(shutdown_note)}</p>'
     body = f"""
 <main data-phase="{html.escape(phase)}">
   <p class="who">{html.escape(email)}</p>
   <h1>{html.escape(heading)}</h1>
-  <p class="detail">{html.escape(message)}</p>
+  <p class="detail">{html.escape(message)}</p>{note}
   <form method="post" action="/wake">
     <button class="primary" type="submit"{disabled}>{html.escape(label)}</button>
   </form>
+  <a class="button secondary" href="/turn-off">Turn off</a>
   <form class="out" method="post" action="/logout">
     <button class="link" type="submit">Sign out</button>
   </form>
 </main>
 """
     return _document(heading, body, refresh=busy)
+
+
+def confirm_off_page(email: str) -> str:
+    body = f"""
+<main>
+  <p class="who">{html.escape(email)}</p>
+  <h1>Turn off the PC?</h1>
+  <p class="detail">Windows will shut down.</p>
+  <form method="post" action="/shutdown">
+    <input type="hidden" name="confirm" value="yes">
+    <button class="danger" type="submit">Turn off</button>
+  </form>
+  <a class="cancel" href="/">Cancel</a>
+</main>
+"""
+    return _document("Turn off the PC?", body, refresh=False)
 
 
 def _document(title: str, body: str, refresh: bool) -> str:
