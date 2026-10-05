@@ -1,0 +1,19 @@
+[Unit]
+Description=PC Remote wake and Steam
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pc-remote
+Group=pc-remote
+WorkingDirectory=/opt/pc-remote
+EnvironmentFile=/etc/pc-remote.env
+ExecStart=/usr/bin/python3 -m app
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
